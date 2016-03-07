@@ -11,9 +11,11 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/layeh/gopus"
@@ -73,6 +75,7 @@ var (
 	OpusEncoder *gopus.Encoder
 
 	InFile      string
+	IsUrl       bool   // is InFile a url
 	CoverFormat string = "jpeg"
 
 	OutFile string = "pipe:1"
@@ -123,16 +126,10 @@ func main() {
 		InFile = os.Args[1]
 	}
 
-	// If reading from a file, verify it exists.
-	if InFile != "pipe:0" {
+	IsUrl = strings.HasPrefix(InFile, "http://") || strings.HasPrefix(InFile, "https://")
 
-		if _, err := os.Stat(InFile); os.IsNotExist(err) {
-			fmt.Println("Error: infile does not exist")
-			flag.Usage()
-			return
-		}
-	} else {
-		// If reading from pipe, make sure pipe is open
+	// If reading from pipe, make sure pipe is open
+	if InFile == "pipe:0" {
 		fi, err := os.Stdin.Stat()
 		if err != nil {
 			fmt.Println(err)
@@ -144,6 +141,22 @@ func main() {
 			flag.Usage()
 			return
 		}
+	} else if IsUrl {
+		// If reading from a URL, verify the URL is valid.
+		resp, err := http.Get(InFile)
+		if err != nil {
+			fmt.Println("HTTP Request Error: ", err)
+			return
+		}
+		if resp.StatusCode != 200 {
+			fmt.Printf("Error: Requesting URL returned HTTP error code %d\n", resp.StatusCode)
+			return
+		}
+	} else if _, err := os.Stat(InFile); os.IsNotExist(err) {
+		// If reading from a file, verify it exists.
+		fmt.Println("Error: infile does not exist")
+		flag.Usage()
+		return
 	}
 
 	//////////////////////////////////////////////////////////////////////////
@@ -205,7 +218,54 @@ func main() {
 		_ = Metadata
 
 		// get ffprobe data
-		if InFile != "pipe:0" {
+		if InFile == "pipe:0" {
+			Metadata.Origin = &OriginMetadata{
+				Source:   "pipe",
+				Channels: Channels,
+				Encoding: "pcm16/s16le",
+			}
+		} else if IsUrl {
+			cmd := exec.Command("youtube-dl", "-i", "-j", "--youtube-skip-dash-manifest", InFile)
+			cmd.Stderr = os.Stderr
+
+			output, err := cmd.StdoutPipe()
+			if err != nil {
+				fmt.Println("StdoutPipe Error: ", err)
+				return
+			}
+
+			err = cmd.Start()
+			if err != nil {
+				fmt.Println("RunStart Error:", err)
+				return
+			}
+			defer func() {
+				cmd.Process.Kill()
+				cmd.Wait()
+			}()
+
+			scanner := bufio.NewScanner(output)
+
+			for scanner.Scan() {
+				s := YTDLEntry{}
+				err = json.Unmarshal(scanner.Bytes(), &s)
+				if err != nil {
+					fmt.Println(err)
+					continue
+				}
+
+				Metadata.SongInfo = &SongMetadata{
+					Title: s.Title,
+				}
+
+				Metadata.Origin = &OriginMetadata{
+					Source:   "file",
+					Encoding: s.Codec,
+					Url:      s.Url,
+				}
+				break
+			}
+		} else {
 			ffprobe := exec.Command("ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", InFile)
 			ffprobe.Stdout = &CmdBuf
 
@@ -281,12 +341,6 @@ func main() {
 
 			CmdBuf.Reset()
 			PngBuf.Reset()
-		} else {
-			Metadata.Origin = &OriginMetadata{
-				Source:   "pipe",
-				Channels: Channels,
-				Encoding: "pcm16/s16le",
-			}
 		}
 	}
 
@@ -316,8 +370,82 @@ func reader() {
 	}()
 
 	// read from file
-	if InFile != "pipe:0" {
+	if InFile == "pipe:0" {
+		// read input from stdin pipe
 
+		// 16KB input buffer
+		rbuf := bufio.NewReaderSize(os.Stdin, 16384)
+		for {
+
+			// read data from stdin
+			InBuf := make([]int16, FrameSize*Channels)
+
+			err = binary.Read(rbuf, binary.LittleEndian, &InBuf)
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return
+			}
+			if err != nil {
+				fmt.Println("Error reading from ffmpeg stdout : ", err)
+				return
+			}
+
+			// write pcm data to the EncodeChan
+			EncodeChan <- InBuf
+		}
+	} else if IsUrl {
+		// Create a shell command "object" to run.
+		ytdl := exec.Command("youtube-dl", "-v", "-f", "bestaudio", "-o", "-", InFile)
+		ytdlout, err := ytdl.StdoutPipe()
+		if err != nil {
+			fmt.Println("ytdl StdoutPipe Error:", err)
+			return
+		}
+		ytdlbuf := bufio.NewReaderSize(ytdlout, 16384)
+
+		// Create a shell command "object" to run.
+		ffmpeg := exec.Command("ffmpeg", "-i", "pipe:0", "-vol", strconv.Itoa(Volume), "-f", "s16le", "-ar", strconv.Itoa(FrameRate), "-ac", strconv.Itoa(Channels), "pipe:1")
+		ffmpeg.Stdin = ytdlbuf
+		stdout, err := ffmpeg.StdoutPipe()
+		if err != nil {
+			fmt.Println("StdoutPipe Error: ", err)
+			return
+		}
+
+		// Starts the youtube-dl command
+		err = ytdl.Start()
+		if err != nil {
+			fmt.Println("RunStart Error:", err)
+			return
+		}
+		defer func() {
+			go ytdl.Wait()
+		}()
+
+		// Starts the ffmpeg command
+		err = ffmpeg.Start()
+		if err != nil {
+			fmt.Println("RunStart Error: ", err)
+			return
+		}
+
+		for {
+
+			// read data from ffmpeg stdout
+			InBuf := make([]int16, FrameSize*Channels)
+			err = binary.Read(stdout, binary.LittleEndian, &InBuf)
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return
+			}
+			if err != nil {
+				fmt.Println("Error reading from ffmpeg stdout : ", err)
+				return
+			}
+
+			// write pcm data to the EncodeChan
+			EncodeChan <- InBuf
+
+		}
+	} else {
 		// Create a shell command "object" to run.
 		ffmpeg := exec.Command("ffmpeg", "-i", InFile, "-vol", strconv.Itoa(Volume), "-f", "s16le", "-ar", strconv.Itoa(FrameRate), "-ac", strconv.Itoa(Channels), "pipe:1")
 		stdout, err := ffmpeg.StdoutPipe()
@@ -349,28 +477,6 @@ func reader() {
 			// write pcm data to the EncodeChan
 			EncodeChan <- InBuf
 
-		}
-	} else {
-		// read input from stdin pipe
-
-		// 16KB input buffer
-		rbuf := bufio.NewReaderSize(os.Stdin, 16384)
-		for {
-
-			// read data from stdin
-			InBuf := make([]int16, FrameSize*Channels)
-
-			err = binary.Read(rbuf, binary.LittleEndian, &InBuf)
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				return
-			}
-			if err != nil {
-				fmt.Println("Error reading from ffmpeg stdout : ", err)
-				return
-			}
-
-			// write pcm data to the EncodeChan
-			EncodeChan <- InBuf
 		}
 	}
 
@@ -453,7 +559,7 @@ func writer() {
 		opus, ok := <-OutputChan
 		if !ok {
 			// if chan closed, exit
-			wbuf.Flush();
+			wbuf.Flush()
 			return
 		}
 
