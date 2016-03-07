@@ -72,6 +72,9 @@ var (
 
 	Volume int // change audio volume (256=normal)
 
+	DCAMode string // decode or encode
+
+	OpusDecoder *gopus.Decoder
 	OpusEncoder *gopus.Encoder
 
 	InFile      string
@@ -81,8 +84,11 @@ var (
 	OutFile string = "pipe:1"
 	OutBuf  []byte
 
-	EncodeChan chan []int16
-	OutputChan chan []byte
+	DecodeInputChan chan []byte
+	DecodeOutputChan chan []int16
+
+	EncodeInputChan chan []int16
+	EncodeOutputChan chan []byte
 
 	err error
 
@@ -102,6 +108,7 @@ func init() {
 	flag.BoolVar(&RawOutput, "raw", false, "Raw opus output (no metadata or magic bytes)")
 	flag.StringVar(&Application, "aa", "audio", "audio application can be voip, audio, or lowdelay")
 	flag.StringVar(&CoverFormat, "cf", "jpeg", "format the cover art will be encoded with")
+	flag.StringVar(&DCAMode, "mode", "", "specify whether to encode (default) or decode")
 
 	if len(os.Args) < 2 {
 		flag.Usage()
@@ -128,6 +135,13 @@ func main() {
 
 	IsUrl = strings.HasPrefix(InFile, "http://") || strings.HasPrefix(InFile, "https://")
 
+	if !IsUrl && InFile == "" && strings.HasSuffix(InFile, ".dca") {
+		DCAMode = "decode"
+	}
+
+	//////////////////////////////////////////////////////////////////////////
+	// BLOCK : Create chans, buffers, and encoder for use
+	//////////////////////////////////////////////////////////////////////////
 	// If reading from pipe, make sure pipe is open
 	if InFile == "pipe:0" {
 		fi, err := os.Stdin.Stat()
@@ -163,184 +177,194 @@ func main() {
 	// BLOCK : Create chans, buffers, and encoder for use
 	//////////////////////////////////////////////////////////////////////////
 
+
 	// create an opusEncoder to use
-	OpusEncoder, err = gopus.NewEncoder(FrameRate, Channels, gopus.Audio)
-	if err != nil {
-		fmt.Println("NewEncoder Error: ", err)
-		return
-	}
-
-	// set opus encoding options
-	//	OpusEncoder.SetVbr(true)                // bool
-
-	if Bitrate < 1 || Bitrate > 512 {
-		Bitrate = 64 // Set to Discord default
-	}
-	OpusEncoder.SetBitrate(Bitrate * 1000)
-
-	switch Application {
-	case "voip":
-		OpusEncoder.SetApplication(gopus.Voip)
-	case "audio":
-		OpusEncoder.SetApplication(gopus.Audio)
-	case "lowdelay":
-		OpusEncoder.SetApplication(gopus.RestrictedLowDelay)
-	default:
-		OpusEncoder.SetApplication(gopus.Audio)
-	}
-
-	OutputChan = make(chan []byte, 10)
-	EncodeChan = make(chan []int16, 10)
-
-	if RawOutput == false {
-		// Setup the metadata
-		Metadata = MetadataStruct{
-			Dca: &DCAMetadata{
-				Version: FormatVersion,
-				Tool: &DCAToolMetadata{
-					Name:    "dca",
-					Version: ProgramVersion,
-					Url:     GitHubRepositoryURL,
-					Author:  "bwmarrin",
-				},
-			},
-			SongInfo: &SongMetadata{},
-			Origin:   &OriginMetadata{},
-			Opus: &OpusMetadata{
-				Bitrate:     Bitrate * 1000,
-				SampleRate:  FrameRate,
-				Application: Application,
-				FrameSize:   FrameSize,
-				Channels:    Channels,
-			},
-			Extra: &ExtraMetadata{},
+	if DCAMode == "decode" {
+		OpusDecoder, err = gopus.NewDecoder(FrameRate, Channels)
+		if err != nil {
+			fmt.Println("NewDecoder Error: ", err)
+			return
 		}
-		_ = Metadata
 
-		// get ffprobe data
-		if InFile == "pipe:0" {
-			Metadata.Origin = &OriginMetadata{
-				Source:   "pipe",
-				Channels: Channels,
-				Encoding: "pcm16/s16le",
+		DecodeInputChan = make(chan []byte, 10)
+		DecodeOutputChan = make(chan []int16, 10)
+	} else {
+		// create an opusEncoder to use
+		OpusEncoder, err = gopus.NewEncoder(FrameRate, Channels, gopus.Audio)
+		if err != nil {
+			fmt.Println("NewEncoder Error: ", err)
+			return
+		}
+
+		// set opus encoding options
+		//	OpusEncoder.SetVbr(true)                // bool
+
+		if Bitrate < 1 || Bitrate > 512 {
+			Bitrate = 64 // Set to Discord default
+		}
+		OpusEncoder.SetBitrate(Bitrate * 1000)
+
+		switch Application {
+		case "voip":
+			OpusEncoder.SetApplication(gopus.Voip)
+		case "lowdelay":
+			OpusEncoder.SetApplication(gopus.RestrictedLowDelay)
+		default:
+			OpusEncoder.SetApplication(gopus.Audio)
+		}
+		EncodeInputChan = make(chan []int16, 10)
+		EncodeOutputChan = make(chan []byte, 10)
+
+		if RawOutput == false {
+			// Setup the metadata
+			Metadata = MetadataStruct{
+				Dca: &DCAMetadata{
+					Version: FormatVersion,
+					Tool: &DCAToolMetadata{
+						Name:    "dca",
+						Version: ProgramVersion,
+						Url:     GitHubRepositoryURL,
+						Author:  "bwmarrin",
+					},
+				},
+				SongInfo: &SongMetadata{},
+				Origin:   &OriginMetadata{},
+				Opus: &OpusMetadata{
+					Bitrate:     Bitrate * 1000,
+					SampleRate:  FrameRate,
+					Application: Application,
+					FrameSize:   FrameSize,
+					Channels:    Channels,
+				},
+				Extra: &ExtraMetadata{},
 			}
-		} else if IsUrl {
-			cmd := exec.Command("youtube-dl", "-i", "-j", "--youtube-skip-dash-manifest", InFile)
-			cmd.Stderr = os.Stderr
+			_ = Metadata
 
-			output, err := cmd.StdoutPipe()
-			if err != nil {
-				fmt.Println("StdoutPipe Error: ", err)
-				return
-			}
+			// get ffprobe data
+			if InFile == "pipe:0" {
+				Metadata.Origin = &OriginMetadata{
+					Source:   "pipe",
+					Channels: Channels,
+					Encoding: "pcm16/s16le",
+				}
+			} else if IsUrl {
+				cmd := exec.Command("youtube-dl", "-i", "-j", "--youtube-skip-dash-manifest", InFile)
+				cmd.Stderr = os.Stderr
 
-			err = cmd.Start()
-			if err != nil {
-				fmt.Println("RunStart Error:", err)
-				return
-			}
-			defer func() {
-				cmd.Process.Kill()
-				cmd.Wait()
-			}()
-
-			scanner := bufio.NewScanner(output)
-
-			for scanner.Scan() {
-				s := YTDLEntry{}
-				err = json.Unmarshal(scanner.Bytes(), &s)
+				output, err := cmd.StdoutPipe()
 				if err != nil {
-					fmt.Println(err)
-					continue
+					fmt.Println("StdoutPipe Error: ", err)
+					return
+				}
+
+				err = cmd.Start()
+				if err != nil {
+					fmt.Println("RunStart Error: ", err)
+					return
+				}
+				defer func() {
+					cmd.Process.Kill()
+					cmd.Wait()
+				}()
+
+				scanner := bufio.NewScanner(output)
+
+				for scanner.Scan() {
+					s := YTDLEntry{}
+					err = json.Unmarshal(scanner.Bytes(), &s)
+					if err != nil {
+						fmt.Println(err)
+						continue
+					}
+
+					Metadata.SongInfo = &SongMetadata{
+						Title: s.Title,
+					}
+
+					Metadata.Origin = &OriginMetadata{
+						Source:   "file",
+						Encoding: s.Codec,
+						Url:      s.Url,
+					}
+					break
+				}
+			} else {
+				ffprobe := exec.Command("ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", InFile)
+				ffprobe.Stdout = &CmdBuf
+
+				err = ffprobe.Start()
+				if err != nil {
+					fmt.Println("RunStart Error: ", err)
+					return
+				}
+
+				err = ffprobe.Wait()
+				if err != nil {
+					fmt.Println("FFprobe Error: ", err)
+					return
+				}
+
+				err = json.Unmarshal(CmdBuf.Bytes(), &FFprobeData)
+				if err != nil {
+					fmt.Println("Error unmarshaling the FFprobe JSON: ", err)
+					return
+				}
+
+				bitrateInt, err := strconv.Atoi(FFprobeData.Format.Bitrate)
+				if err != nil {
+					fmt.Println("Could not convert bitrate to int: ", err)
+					return
 				}
 
 				Metadata.SongInfo = &SongMetadata{
-					Title: s.Title,
+					Title:    FFprobeData.Format.Tags.Title,
+					Artist:   FFprobeData.Format.Tags.Artist,
+					Album:    FFprobeData.Format.Tags.Album,
+					Genre:    FFprobeData.Format.Tags.Genre,
+					Comments: "", // change later?
 				}
 
 				Metadata.Origin = &OriginMetadata{
 					Source:   "file",
-					Encoding: s.Codec,
-					Url:      s.Url,
+					Bitrate:  bitrateInt,
+					Channels: Channels,
+					Encoding: FFprobeData.Format.FormatLongName,
 				}
-				break
-			}
-		} else {
-			ffprobe := exec.Command("ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", InFile)
-			ffprobe.Stdout = &CmdBuf
 
-			err = ffprobe.Start()
-			if err != nil {
-				fmt.Println("RunStart Error: ", err)
-				return
-			}
+				CmdBuf.Reset()
 
-			err = ffprobe.Wait()
-			if err != nil {
-				fmt.Println("FFprobe Error: ", err)
-				return
-			}
+				// get cover art
+				cover := exec.Command("ffmpeg", "-loglevel", "0", "-i", InFile, "-f", "singlejpeg", "pipe:1")
+				cover.Stdout = &CmdBuf
 
-			err = json.Unmarshal(CmdBuf.Bytes(), &FFprobeData)
-			if err != nil {
-				fmt.Println("Error unmarshaling the FFprobe JSON: ", err)
-				return
-			}
+				err = cover.Start()
+				if err != nil {
+					fmt.Println("RunStart Error: ", err)
+					return
+				}
 
-			bitrateInt, err := strconv.Atoi(FFprobeData.Format.Bitrate)
-			if err != nil {
-				fmt.Println("Could not convert bitrate to int: ", err)
-				return
-			}
+				err = cover.Wait()
+				if err == nil {
+					buf := bytes.NewBufferString(CmdBuf.String())
 
-			Metadata.SongInfo = &SongMetadata{
-				Title:    FFprobeData.Format.Tags.Title,
-				Artist:   FFprobeData.Format.Tags.Artist,
-				Album:    FFprobeData.Format.Tags.Album,
-				Genre:    FFprobeData.Format.Tags.Genre,
-				Comments: "", // change later?
-			}
-
-			Metadata.Origin = &OriginMetadata{
-				Source:   "file",
-				Bitrate:  bitrateInt,
-				Channels: Channels,
-				Encoding: FFprobeData.Format.FormatLongName,
-			}
-
-			CmdBuf.Reset()
-
-			// get cover art
-			cover := exec.Command("ffmpeg", "-loglevel", "0", "-i", InFile, "-f", "singlejpeg", "pipe:1")
-			cover.Stdout = &CmdBuf
-
-			err = cover.Start()
-			if err != nil {
-				fmt.Println("RunStart Error: ", err)
-				return
-			}
-
-			err = cover.Wait()
-			if err == nil {
-				buf := bytes.NewBufferString(CmdBuf.String())
-
-				if CoverFormat == "png" {
-					img, err := jpeg.Decode(buf)
-					if err == nil { // silently drop it, no image
-						err = png.Encode(&PngBuf, img)
-						if err == nil {
-							CoverImage = base64.StdEncoding.EncodeToString(PngBuf.Bytes())
+					if CoverFormat == "png" {
+						img, err := jpeg.Decode(buf)
+						if err == nil { // silently drop it, no image
+							err = png.Encode(&PngBuf, img)
+							if err == nil {
+								CoverImage = base64.StdEncoding.EncodeToString(PngBuf.Bytes())
+							}
 						}
+					} else {
+						CoverImage = base64.StdEncoding.EncodeToString(CmdBuf.Bytes())
 					}
-				} else {
-					CoverImage = base64.StdEncoding.EncodeToString(CmdBuf.Bytes())
+
+					Metadata.SongInfo.Cover = &CoverImage
 				}
 
-				Metadata.SongInfo.Cover = &CoverImage
+				CmdBuf.Reset()
+				PngBuf.Reset()
 			}
-
-			CmdBuf.Reset()
-			PngBuf.Reset()
 		}
 	}
 
@@ -348,24 +372,125 @@ func main() {
 	// BLOCK : Start reader and writer workers
 	//////////////////////////////////////////////////////////////////////////
 
-	wg.Add(1)
-	go reader()
+	if DCAMode == "decode" {
+		wg.Add(1)
+		go dcaReader()
 
-	wg.Add(1)
-	go encoder()
+		wg.Add(1)
+		go decoder()
 
-	wg.Add(1)
-	go writer()
+		wg.Add(1)
+		go pcmWriter()
+	} else {
+		wg.Add(1)
+		go pcmReader()
+
+		wg.Add(1)
+		go encoder()
+
+		wg.Add(1)
+		go dcaWriter()
+	}
 
 	// wait for above goroutines to finish, then exit.
 	wg.Wait()
 }
 
-// reader reads from the input
-func reader() {
+// dcaReader reads DCA from the input
+func dcaReader() {
 
 	defer func() {
-		close(EncodeChan)
+		close(DecodeInputChan)
+		wg.Done()
+	}()
+
+	var dcabuf io.Reader
+
+	if InFile == "pipe:0" {
+		dcabuf = bufio.NewReaderSize(os.Stdin, 16384)
+	} else if IsUrl {
+		resp, err := http.Get(InFile)
+		if err != nil {
+			fmt.Println("HTTP Request Error: ", err)
+			return
+		}
+
+		dcabuf = resp.Body
+	} else {
+		file, err := os.Open(InFile)
+		if err != nil {
+			fmt.Println("Error opening file: ", err)
+			return
+		}
+
+		dcabuf = bufio.NewReaderSize(file, 16384)
+	}
+
+	var dcaver uint32
+
+	err = binary.Read(dcabuf, binary.LittleEndian, &dcaver)
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return
+	}
+	if err != nil {
+		fmt.Println("Error reading from dca: ", err)
+		return
+	}
+
+	var jsonlen uint32
+
+	err = binary.Read(dcabuf, binary.LittleEndian, &jsonlen)
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return
+	}
+	if err != nil {
+		fmt.Println("Error reading from dca: ", err)
+		return
+	}
+
+	jsondata := make([]byte, jsonlen)
+
+	err = binary.Read(dcabuf, binary.LittleEndian, &jsondata)
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return
+	}
+	if err != nil {
+		fmt.Println("Error reading from dca: ", err)
+		return
+	}
+
+	var opuslen uint16
+	for {
+		err = binary.Read(dcabuf, binary.LittleEndian, &opuslen)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return
+		}
+		if err != nil {
+			fmt.Println("Error reading from dca: ", err)
+			return
+		}
+
+		// read opus data from dca
+		opus := make([]byte, opuslen)
+		err = binary.Read(dcabuf, binary.LittleEndian, &opus)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return
+		}
+		if err != nil {
+			fmt.Println("Error reading from dca: ", err)
+			return
+		}
+
+		// Send received opus to the decoder channel
+		DecodeInputChan <- opus
+	}
+}
+
+// pcmReader reads PCM from the input
+func pcmReader() {
+
+	defer func() {
+		close(EncodeInputChan)
 		wg.Done()
 	}()
 
@@ -385,19 +510,19 @@ func reader() {
 				return
 			}
 			if err != nil {
-				fmt.Println("Error reading from ffmpeg stdout : ", err)
+				fmt.Println("Error reading from stdout: ", err)
 				return
 			}
 
-			// write pcm data to the EncodeChan
-			EncodeChan <- InBuf
+			// write pcm data to the EncodeInputChan
+			EncodeInputChan <- InBuf
 		}
 	} else if IsUrl {
 		// Create a shell command "object" to run.
 		ytdl := exec.Command("youtube-dl", "-v", "-f", "bestaudio", "-o", "-", InFile)
 		ytdlout, err := ytdl.StdoutPipe()
 		if err != nil {
-			fmt.Println("ytdl StdoutPipe Error:", err)
+			fmt.Println("ytdl StdoutPipe Error: ", err)
 			return
 		}
 		ytdlbuf := bufio.NewReaderSize(ytdlout, 16384)
@@ -414,7 +539,7 @@ func reader() {
 		// Starts the youtube-dl command
 		err = ytdl.Start()
 		if err != nil {
-			fmt.Println("RunStart Error:", err)
+			fmt.Println("RunStart Error: ", err)
 			return
 		}
 		defer func() {
@@ -441,8 +566,8 @@ func reader() {
 				return
 			}
 
-			// write pcm data to the EncodeChan
-			EncodeChan <- InBuf
+			// write pcm data to the EncodeInputChan
+			EncodeInputChan <- InBuf
 
 		}
 	} else {
@@ -474,25 +599,53 @@ func reader() {
 				return
 			}
 
-			// write pcm data to the EncodeChan
-			EncodeChan <- InBuf
+			// write pcm data to the EncodeInputChan
+			EncodeInputChan <- InBuf
 
 		}
 	}
 
 }
 
-// encoder listens on the EncodeChan and encodes provided PCM16 data
-// to opus, then sends the encoded data to the OutputChan
-func encoder() {
+// decoder listens on the DecodeInputChan and decodes provided opus data
+// to PCM16, then sends the decoded data to the DecodeOutputChan
+func decoder() {
 
 	defer func() {
-		close(OutputChan)
+		close(DecodeOutputChan)
 		wg.Done()
 	}()
 
 	for {
-		pcm, ok := <-EncodeChan
+		opus, ok := <-DecodeInputChan
+		if !ok {
+			// if chan closed, exit
+			return
+		}
+
+		// try decoding opus frame with Opus
+		pcm, err := OpusDecoder.Decode(opus, FrameSize, false)
+		if err != nil {
+			fmt.Println("Decoding Error: ", err)
+			return
+		}
+
+		// write pcm data to DecodeOutputChan
+		DecodeOutputChan <- pcm
+	}
+}
+
+// encoder listens on the EncodeInputChan and encodes provided PCM16 data
+// to opus, then sends the encoded data to the EncodeOutputChan
+func encoder() {
+
+	defer func() {
+		close(EncodeOutputChan)
+		wg.Done()
+	}()
+
+	for {
+		pcm, ok := <-EncodeInputChan
 		if !ok {
 			// if chan closed, exit
 			return
@@ -505,14 +658,51 @@ func encoder() {
 			return
 		}
 
-		// write opus data to OutputChan
-		OutputChan <- opus
+		// write opus data to EncodeOutputChan
+		EncodeOutputChan <- opus
 	}
 }
 
-// writer listens on the OutputChan and writes the output to stdout pipe
-// TODO: Add support for writing directly to a file
-func writer() {
+// pcmWriter listens on the DecodeOutputChan and writes output to stdout
+// or a file
+func pcmWriter() {
+
+	defer wg.Done()
+
+	// 16KB output buffer
+	var wbuf *bufio.Writer
+	if OutFile == "pipe:1" {
+		wbuf = bufio.NewWriterSize(os.Stdout, 16384)
+	} else {
+		file, err := os.Create(OutFile)
+		if err != nil {
+			fmt.Println("Failed to open output file: ", err)
+			return
+		}
+
+		wbuf = bufio.NewWriterSize(file, 16384)
+	}
+
+	for {
+		pcm, ok := <-DecodeOutputChan
+		if !ok {
+			// if chan closed, exit
+			wbuf.Flush()
+			return
+		}
+
+		// write pcm data to stdout
+		err = binary.Write(wbuf, binary.LittleEndian, &pcm)
+		if err != nil {
+			fmt.Println("Error writing output: ", err)
+			return
+		}
+	}
+}
+
+// dcaWriter listens on the EncodeOutputChan and writes output to stdout
+// or a file
+func dcaWriter() {
 
 	defer wg.Done()
 
@@ -556,7 +746,7 @@ func writer() {
 	}
 
 	for {
-		opus, ok := <-OutputChan
+		opus, ok := <-EncodeOutputChan
 		if !ok {
 			// if chan closed, exit
 			wbuf.Flush()
