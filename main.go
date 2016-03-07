@@ -90,6 +90,7 @@ var (
 func init() {
 
 	flag.StringVar(&InFile, "i", "pipe:0", "infile")
+	flag.StringVar(&OutFile, "o", "pipe:1", "output file")
 	flag.IntVar(&Volume, "vol", 256, "change audio volume (256=normal)")
 	flag.IntVar(&Channels, "ac", 2, "audio channels")
 	flag.IntVar(&FrameRate, "ar", 48000, "audio sampling rate")
@@ -126,23 +127,20 @@ func main() {
 	if InFile != "pipe:0" {
 
 		if _, err := os.Stat(InFile); os.IsNotExist(err) {
-			fmt.Println("error: infile does not exist")
+			fmt.Println("Error: infile does not exist")
 			flag.Usage()
 			return
 		}
-	}
-
-	// If reading from pipe, make sure pipe is open
-	if InFile == "pipe:0" {
+	} else {
+		// If reading from pipe, make sure pipe is open
 		fi, err := os.Stdin.Stat()
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
 
-		if (fi.Mode() & os.ModeCharDevice) == 0 {
-		} else {
-			fmt.Println("error: stdin is not a pipe.")
+		if (fi.Mode() & os.ModeCharDevice) != 0 {
+			fmt.Println("Error: stdin is not a pipe.")
 			flag.Usage()
 			return
 		}
@@ -155,7 +153,7 @@ func main() {
 	// create an opusEncoder to use
 	OpusEncoder, err = gopus.NewEncoder(FrameRate, Channels, gopus.Audio)
 	if err != nil {
-		fmt.Println("NewEncoder Error:", err)
+		fmt.Println("NewEncoder Error: ", err)
 		return
 	}
 
@@ -213,25 +211,25 @@ func main() {
 
 			err = ffprobe.Start()
 			if err != nil {
-				fmt.Println("RunStart Error:", err)
+				fmt.Println("RunStart Error: ", err)
 				return
 			}
 
 			err = ffprobe.Wait()
 			if err != nil {
-				fmt.Println("FFprobe Error:", err)
+				fmt.Println("FFprobe Error: ", err)
 				return
 			}
 
 			err = json.Unmarshal(CmdBuf.Bytes(), &FFprobeData)
 			if err != nil {
-				fmt.Println("Erorr unmarshaling the FFprobe JSON:", err)
+				fmt.Println("Error unmarshaling the FFprobe JSON: ", err)
 				return
 			}
 
 			bitrateInt, err := strconv.Atoi(FFprobeData.Format.Bitrate)
 			if err != nil {
-				fmt.Println("Could not convert bitrate to int:", err)
+				fmt.Println("Could not convert bitrate to int: ", err)
 				return
 			}
 
@@ -258,7 +256,7 @@ func main() {
 
 			err = cover.Start()
 			if err != nil {
-				fmt.Println("RunStart Error:", err)
+				fmt.Println("RunStart Error: ", err)
 				return
 			}
 
@@ -324,14 +322,14 @@ func reader() {
 		ffmpeg := exec.Command("ffmpeg", "-i", InFile, "-vol", strconv.Itoa(Volume), "-f", "s16le", "-ar", strconv.Itoa(FrameRate), "-ac", strconv.Itoa(Channels), "pipe:1")
 		stdout, err := ffmpeg.StdoutPipe()
 		if err != nil {
-			fmt.Println("StdoutPipe Error:", err)
+			fmt.Println("StdoutPipe Error: ", err)
 			return
 		}
 
 		// Starts the ffmpeg command
 		err = ffmpeg.Start()
 		if err != nil {
-			fmt.Println("RunStart Error:", err)
+			fmt.Println("RunStart Error: ", err)
 			return
 		}
 
@@ -344,7 +342,7 @@ func reader() {
 				return
 			}
 			if err != nil {
-				fmt.Println("error reading from ffmpeg stdout :", err)
+				fmt.Println("Error reading from ffmpeg stdout : ", err)
 				return
 			}
 
@@ -352,10 +350,8 @@ func reader() {
 			EncodeChan <- InBuf
 
 		}
-	}
-
-	// read input from stdin pipe
-	if InFile == "pipe:0" {
+	} else {
+		// read input from stdin pipe
 
 		// 16KB input buffer
 		rbuf := bufio.NewReaderSize(os.Stdin, 16384)
@@ -369,7 +365,7 @@ func reader() {
 				return
 			}
 			if err != nil {
-				fmt.Println("error reading from ffmpeg stdout :", err)
+				fmt.Println("Error reading from ffmpeg stdout : ", err)
 				return
 			}
 
@@ -399,7 +395,7 @@ func encoder() {
 		// try encoding pcm frame with Opus
 		opus, err := OpusEncoder.Encode(pcm, FrameSize, MaxBytes)
 		if err != nil {
-			fmt.Println("Encoding Error:", err)
+			fmt.Println("Encoding Error: ", err)
 			return
 		}
 
@@ -418,23 +414,34 @@ func writer() {
 	var jsonlen int32
 
 	// 16KB output buffer
-	wbuf := bufio.NewWriterSize(os.Stdout, 16384)
+	var wbuf *bufio.Writer
+	if OutFile == "pipe:1" {
+		wbuf = bufio.NewWriterSize(os.Stdout, 16384)
+	} else {
+		file, err := os.Create(OutFile)
+		if err != nil {
+			fmt.Println("Failed to open output file: ", err)
+			return
+		}
+
+		wbuf = bufio.NewWriterSize(file, 16384)
+	}
 
 	if RawOutput == false {
 		// write the magic bytes
-		fmt.Print(MagicBytes)
+		wbuf.WriteString(MagicBytes)
 
 		// encode and write json length
 		json, err := json.Marshal(Metadata)
 		if err != nil {
-			fmt.Println("Failed to encode the Metadata JSON:", err)
+			fmt.Println("Failed to encode the Metadata JSON: ", err)
 			return
 		}
 
 		jsonlen = int32(len(json))
 		err = binary.Write(wbuf, binary.LittleEndian, &jsonlen)
 		if err != nil {
-			fmt.Println("error writing output: ", err)
+			fmt.Println("Error writing output: ", err)
 			return
 		}
 
@@ -446,6 +453,7 @@ func writer() {
 		opus, ok := <-OutputChan
 		if !ok {
 			// if chan closed, exit
+			wbuf.Flush();
 			return
 		}
 
@@ -453,14 +461,14 @@ func writer() {
 		opuslen = int16(len(opus))
 		err = binary.Write(wbuf, binary.LittleEndian, &opuslen)
 		if err != nil {
-			fmt.Println("error writing output: ", err)
+			fmt.Println("Error writing output: ", err)
 			return
 		}
 
 		// write opus data to stdout
 		err = binary.Write(wbuf, binary.LittleEndian, &opus)
 		if err != nil {
-			fmt.Println("error writing output: ", err)
+			fmt.Println("Error writing output: ", err)
 			return
 		}
 	}
